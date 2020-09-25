@@ -31,7 +31,6 @@ from ..quantize import _remove_qconfig
 from .pattern_utils import (
     is_match,
     get_quant_patterns,
-    get_dynamic_quant_patterns,
 )
 
 from .standalone_module import (
@@ -44,6 +43,8 @@ from .quantization_patterns import *
 from .utils import (
     _parent_name,
     quantize_node,
+    activation_is_dynamically_quantized,
+    activation_is_statically_quantized,
 )
 
 from collections import OrderedDict
@@ -307,11 +308,7 @@ class Quantizer:
     def _prepare(self, model, qconfig_dict, inplace, is_dynamic_quant, is_child_module):
         if not inplace:
             model = copy.deepcopy(model)
-        self.is_dynamic_quant = is_dynamic_quant
-        if self.is_dynamic_quant:
-            self.patterns = get_dynamic_quant_patterns()
-        else:
-            self.patterns = get_quant_patterns()
+        self.patterns = get_quant_patterns()
 
         flattened_qconfig_dict = get_flattened_qconfig_dict(qconfig_dict)
         # TODO: support regex as well
@@ -391,7 +388,7 @@ class Quantizer:
                     # observe standalone module
                     standalone_module = self.modules[node.target]
                     traced_standalone_module = symbolic_trace(standalone_module)
-                    if self.is_dynamic_quant:
+                    if activation_is_dynamically_quantized(qconfig):
                         prepare = torch.quantization.prepare_dynamic_child_module_fx
                     else:
                         prepare = torch.quantization.prepare_child_module_fx
@@ -404,8 +401,9 @@ class Quantizer:
                     self.modules[node.target] = observed_standalone_module
 
 
-                # don't need to insert observer for output in dynamic quantization
-                if self.is_dynamic_quant:
+                # don't need to insert observer for output if activation does not
+                # need to be statically quantized
+                if not activation_is_statically_quantized(qconfig):
                     continue
 
                 # inserting observers for output of observed module, or mark the output
@@ -509,10 +507,10 @@ class Quantizer:
         return self._prepare(model, qconfig_dict, inplace, is_dynamic_quant=True, is_child_module=is_child_module)
 
     def _run_weight_observers(self, observed):
-        r''' Extract the subgraph that produces the weight for dynamically quantized
-        node and run the subgraph to observe the weight.
-        Note that the observers of dynamically quantized modules are run during
-        the conversion step.
+        r''' Extract the subgraph that produces the weight for dynamic quant
+        or weight only quant node and run the subgraph to observe the weight.
+        Note that the observers of dynamic quant or weight only quant ops are run during
+        the convert step.
         '''
         for node in observed.graph.nodes:
             if node.op == 'call_function' and node.target in WEIGHT_INDEX_DICT:
@@ -530,13 +528,11 @@ class Quantizer:
     def _convert(self, model, inplace=False, debug=False, is_dynamic_quant=False, is_child_module=False):
         self.restore_state(model)
         # TODO: uncomment after deepcopy is fixed
-        # if not inplace:
-        #     model = copy.deepcopy(model)
-        self.is_dynamic_quant = is_dynamic_quant
-        # run weight observers before inserting quant dequant nodes
-        # for dynamic quantization
-        if self.is_dynamic_quant:
-            self._run_weight_observers(model)
+        if not inplace:
+            model = copy.deepcopy(model)
+        # always run weight observers in the top level forward method
+        # for dynamic quant ops or weight only quant ops
+        self._run_weight_observers(model)
 
         # move to cpu since we only have quantized cpu kernels
         model.eval().cpu()
@@ -637,7 +633,7 @@ class Quantizer:
                     result = self.quantized_graph.node_copy(node, load_non_quantized)
                     quantized = False
                 else:
-                    result = obj.convert(self, node, load_arg)
+                    result = obj.convert(self, node, load_arg, debug=debug)
                     if node.op == 'call_module' and is_observed_standalone_module(self.modules[node.target]):
                         quantized = self.modules[node.target]._output_is_observed
                     else:
@@ -652,8 +648,7 @@ class Quantizer:
                             'CopyNode of type ' + node.op + ' is not handled'
                         quantized = is_quantized(node.args[0])
 
-                    # output of dynamic quantization is not quantized
-                    if self.is_dynamic_quant:
+                    if not activation_is_statically_quantized(qconfig):
                         quantized = False
 
                 if quantized:
@@ -882,7 +877,8 @@ class Quantizer:
                     for i, node_arg in enumerate(node.args):
                         if arg is node_arg and i in WEIGHT_INDEX_DICT[node.target]:
                             is_weight = True
-                if (not self.is_dynamic_quant) or is_weight:
+                if qconfig is not None and \
+                   (activation_is_statically_quantized(qconfig) or is_weight):
                     # overwrite previous quant config
                     quants[arg.name] = (DefaultQuant(self, arg), qconfig, is_weight)
             return visit_arg
